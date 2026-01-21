@@ -1,0 +1,24 @@
+# Istruzioni di Progetto: AI Lecture-to-Doc Workflow
+
+## Obiettivo
+Trasformare video lezioni MP4 in documenti Word/Markdown strutturati usando esclusivamente modelli locali (Faster-Whisper e Ollama).
+
+## Stack Tecnologico & Vincoli
+- **Python:** 3.12 (uv come gestore pacchetti).
+- **GPU:** NVIDIA RTX 3060 (Laptop). Usare sempre CUDA 12.x.
+- **Trascrizione:** Faster-Whisper `large-v3` con compute_type `float16`.
+- **LLM:** Ollama (Llama 3.1 8B o Llama 3.2 3B).
+- **GUI:** Tkinter (mantenere reattiva con threading).
+
+## Regole di Sviluppo
+- **Direct Logic:** Scrivi codice asciutto, senza inutili astrazioni.
+- **Memory Management:** Implementa il chunking del testo (max 2000-3000 parole per chunk) prima di inviarlo a Ollama per evitare crash della VRAM.
+- **Output:** I file generati devono includere timestamp `[MM:SS]` e una struttura a capitoli chiara.
+- **Error Handling:** Gestire esplicitamente la mancanza di CUDA o l'assenza del servizio Ollama attivo.
+
+## Struttura Moduli
+- `main.py`: Punto di ingresso e interfaccia Tkinter.
+- `audio.py`: Estrazione audio da MP4.
+- `transcriber.py`: Logica di trascrizione accelerata.
+- `processor.py`: Prompting e strutturazione testo.
+- `exporter.py`: Generazione file .docx e .md.
