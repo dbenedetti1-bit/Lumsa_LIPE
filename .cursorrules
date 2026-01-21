@@ -16,9 +16,20 @@ Trasformare video lezioni MP4 in documenti Word/Markdown strutturati usando escl
 - **Output:** I file generati devono includere timestamp `[MM:SS]` e una struttura a capitoli chiara.
 - **Error Handling:** Gestire esplicitamente la mancanza di CUDA o l'assenza del servizio Ollama attivo.
 
+Inoltre, visto che userò un modello più pesante (Mistral-Nemo o Qwen 14b) con GPU Offloading parziale:
+
+1. **Timeout:** Imposta un timeout molto alto per la chiamata alle API di Ollama (o rimuovilo/impostalo a None), perché la generazione sarà lenta.
+2. **Context Window (num_ctx):** Nel payload della richiesta a Ollama, imposta esplicitamente `"num_ctx": 4096` (o 8192 se i chunk sono lunghi). Questo è fondamentale per evitare che il modello "dimentichi" l'inizio del chunk se è molto verboso.
+3. **Modello:** Prepara il codice per usare di default `mistral-nemo` (ma rendilo configurabile).
+
 ## Struttura Moduli
 - `main.py`: Punto di ingresso e interfaccia Tkinter.
 - `audio.py`: Estrazione audio da MP4.
 - `transcriber.py`: Logica di trascrizione accelerata.
 - `processor.py`: Prompting e strutturazione testo.
 - `exporter.py`: Generazione file .docx e .md.
+
+# AI & Data Processing Guidelines
+- When writing prompts for LLMs (like Ollama/OpenAI) inside the code, ALWAYS enforce a "Direct Actor" persona unless specified otherwise.
+- Avoid prompts that ask for "analysis" or "summary". Favor prompts that ask for "rewriting", "refactoring", or "content generation".
+- Ensure text chunking logic always includes a safe overlap mechanism (min 10-20%) to preserve context.

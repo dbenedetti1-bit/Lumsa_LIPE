@@ -69,13 +69,18 @@ class App(Tk):
 
         ttk.Label(options, text="Modello Ollama:").pack(side="left")
         self.model_var = ttk.Entry(options, width=18)
-        self.model_var.insert(0, "llama3.1:8b")
+        self.model_var.insert(0, "qwen2.5:14b")
         self.model_var.pack(side="left", padx=(6, 14))
 
         ttk.Label(options, text="Chunk max parole:").pack(side="left")
         self.chunk_var = ttk.Entry(options, width=8)
         self.chunk_var.insert(0, "2500")
         self.chunk_var.pack(side="left", padx=(6, 14))
+
+        ttk.Label(options, text="Overlap (caratteri):").pack(side="left")
+        self.overlap_var = ttk.Entry(options, width=8)
+        self.overlap_var.insert(0, "100")
+        self.overlap_var.pack(side="left", padx=(6, 14))
 
         self.btn_start = ttk.Button(options, text="Avvia workflow", command=self._start, state=DISABLED)
         self.btn_start.pack(side="left")
@@ -121,7 +126,15 @@ class App(Tk):
             messagebox.showerror("Valore non valido", "Chunk max parole deve essere un numero intero.")
             return
 
-        model = self.model_var.get().strip() or "llama3.1:8b"
+        try:
+            overlap = int(self.overlap_var.get().strip())
+            if overlap < 0:
+                raise ValueError("Overlap non può essere negativo")
+        except Exception:
+            messagebox.showerror("Valore non valido", "Overlap deve essere un numero intero non negativo.")
+            return
+
+        model = self.model_var.get().strip() or "qwen2.5:14b"
 
         self.progress.configure(value=0, maximum=100)
         self.btn_start.configure(state=DISABLED)
@@ -130,7 +143,7 @@ class App(Tk):
 
         self._worker = threading.Thread(
             target=self._run_workflow,
-            kwargs={"mp4_path": self.mp4_path, "model": model, "max_words": max_words},
+            kwargs={"mp4_path": self.mp4_path, "model": model, "max_words": max_words, "overlap": overlap},
             daemon=True,
         )
         self._worker.start()
@@ -178,7 +191,7 @@ class App(Tk):
         finally:
             self.after(100, self._drain_events)
 
-    def _run_workflow(self, *, mp4_path: Path, model: str, max_words: int) -> None:
+    def _run_workflow(self, *, mp4_path: Path, model: str, max_words: int, overlap: int) -> None:
         """
         Pipeline completa:
         1) MP4 -> WAV
@@ -235,6 +248,7 @@ class App(Tk):
                     prompts_md_path=Path(__file__).with_name("prompts.md"),
                     model=model,
                     max_words_per_chunk=max_words,
+                    overlap=overlap,
                     progress_cb=lambda d, t: self._emit("progress", ("ollama", d, t)),
                     log_cb=lambda m: self._emit("log", m),
                 )
