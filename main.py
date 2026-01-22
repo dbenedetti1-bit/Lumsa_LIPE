@@ -12,7 +12,7 @@ from tkinter.scrolledtext import ScrolledText
 
 from audio import extract_audio_to_wav
 from exporter import save_docx, save_markdown
-from processor import merge_chunk_results_to_markdown, ollama_process_chunks
+from processor import phase1_clean_transcript, phase2_write_chapter
 from transcriber import load_transcript_from_markdown, segments_to_timestamped_text, transcribe_wav
 
 
@@ -67,12 +67,7 @@ class App(Tk):
         options = ttk.Frame(self)
         options.pack(fill="x", **pad)
 
-        ttk.Label(options, text="Modello Ollama:").pack(side="left")
-        self.model_var = ttk.Entry(options, width=18)
-        self.model_var.insert(0, "qwen2.5:14b")
-        self.model_var.pack(side="left", padx=(6, 14))
-
-        ttk.Label(options, text="Chunk max parole:").pack(side="left")
+        ttk.Label(options, text="Chunk max parole (Fase 1):").pack(side="left")
         self.chunk_var = ttk.Entry(options, width=8)
         self.chunk_var.insert(0, "2500")
         self.chunk_var.pack(side="left", padx=(6, 14))
@@ -134,16 +129,14 @@ class App(Tk):
             messagebox.showerror("Valore non valido", "Overlap deve essere un numero intero non negativo.")
             return
 
-        model = self.model_var.get().strip() or "qwen2.5:14b"
-
         self.progress.configure(value=0, maximum=100)
         self.btn_start.configure(state=DISABLED)
         self.btn_pick.configure(state=DISABLED)
-        self._log("Avvio workflow in background... (trascrizione + ollama)")
+        self._log("Avvio workflow in background... (trascrizione + 2 fasi Ollama)")
 
         self._worker = threading.Thread(
             target=self._run_workflow,
-            kwargs={"mp4_path": self.mp4_path, "model": model, "max_words": max_words, "overlap": overlap},
+            kwargs={"mp4_path": self.mp4_path, "max_words": max_words, "overlap": overlap},
             daemon=True,
         )
         self._worker.start()
@@ -161,11 +154,14 @@ class App(Tk):
                     phase, done, total = payload  # type: ignore[misc]
                     label_txt = ""
                     if phase == "transcription":
-                        val = (done / total) * 70.0 if total and total > 0 else 0
+                        val = (done / total) * 40.0 if total and total > 0 else 0
                         label_txt = _fmt_progress_time("Trascrizione", done, total)
-                    elif phase == "ollama":
+                    elif phase == "phase1":
+                        val = 40.0 + ((done / total) * 30.0 if total and total > 0 else 0)
+                        label_txt = _fmt_progress_chunks("Fase 1 (Cleaner)", done, total)
+                    elif phase == "phase2":
                         val = 70.0 + ((done / total) * 30.0 if total and total > 0 else 0)
-                        label_txt = _fmt_progress_chunks("Ollama", done, total)
+                        label_txt = _fmt_progress_chunks("Fase 2 (Author)", done, total)
                     else:
                         val = 0
                     self.progress.configure(value=min(val, 100))
@@ -191,13 +187,14 @@ class App(Tk):
         finally:
             self.after(100, self._drain_events)
 
-    def _run_workflow(self, *, mp4_path: Path, model: str, max_words: int, overlap: int) -> None:
+    def _run_workflow(self, *, mp4_path: Path, max_words: int, overlap: int) -> None:
         """
-        Pipeline completa:
+        Pipeline completa a due fasi:
         1) MP4 -> WAV
         2) Whisper -> segmenti (timestamp)
-        3) Chunk + Ollama -> capitoli/riassunto/glossario
-        4) Export MD + DOCX
+        3) FASE 1: Cleaner (llama3.1:8b) -> appunti puliti
+        4) FASE 2: Author (qwen2.5:14b) -> capitolo di libro
+        5) Export MD + DOCX
         """
         try:
             t0 = time.time()
@@ -241,38 +238,64 @@ class App(Tk):
             if not transcript_text or len(transcript_text.strip()) < 10:
                 raise RuntimeError("Trascrizione vuota o troppo corta. Verifica il file audio o riprova la trascrizione.")
 
-            self._emit("log", f"Elaborazione con Ollama ({model}) e chunking...")
+            # ========================================================================
+            # FASE 1: "The Cleaner" - Pulizia e compressione
+            # ========================================================================
+            self._emit("log", "FASE 1: Pulizia trascrizione con llama3.1:8b...")
             try:
-                results = ollama_process_chunks(
+                cleaned_notes = phase1_clean_transcript(
                     transcript_text,
-                    prompts_md_path=Path(__file__).with_name("prompts.md"),
-                    model=model,
+                    model="llama3.1:8b",
                     max_words_per_chunk=max_words,
                     overlap=overlap,
-                    progress_cb=lambda d, t: self._emit("progress", ("ollama", d, t)),
+                    progress_cb=lambda d, t: self._emit("progress", ("phase1", d, t)),
                     log_cb=lambda m: self._emit("log", m),
                 )
             except Exception as e:
-                self._emit("log", f"ERRORE durante elaborazione Ollama: {e}")
+                self._emit("log", f"ERRORE durante FASE 1 (Cleaner): {e}")
                 raise
 
-            if not results:
-                raise RuntimeError("Nessun risultato da Ollama. Verifica il servizio e il modello.")
+            if not cleaned_notes or len(cleaned_notes.strip()) < 10:
+                raise RuntimeError("FASE 1: Output vuoto o troppo corto. Verifica il modello llama3.1:8b.")
 
-            self._emit("log", f"Ricevuti {len(results)} chunk elaborati da Ollama")
-            
+            # Salva file intermedio
+            temp_cleaned_path = out_dir / "temp_cleaned_notes.md"
+            save_markdown(temp_cleaned_path, cleaned_notes)
+            self._emit("log", f"FASE 1 completata: appunti puliti salvati in {temp_cleaned_path.name}")
+
+            # ========================================================================
+            # FASE 2: "The Author" - Scrittura capitolo
+            # ========================================================================
+            self._emit("log", "FASE 2: Scrittura capitolo con qwen2.5:14b (può richiedere tempo)...")
             try:
-                structured_md = "# Documento Strutturato\n\n" + merge_chunk_results_to_markdown(results)
-                structured_md_path = out_dir / f"{mp4_path.stem}.structured.md"
-                save_markdown(structured_md_path, structured_md)
-                self._emit("log", f"Salvato Markdown strutturato: {structured_md_path.name}")
+                chapter_text = phase2_write_chapter(
+                    cleaned_notes,
+                    prompts_md_path=Path(__file__).with_name("prompts.md"),
+                    model="qwen2.5:14b",
+                    progress_cb=lambda d, t: self._emit("progress", ("phase2", d, t)),
+                    log_cb=lambda m: self._emit("log", m),
+                )
+            except Exception as e:
+                self._emit("log", f"ERRORE durante FASE 2 (Author): {e}")
+                raise
+
+            if not chapter_text or len(chapter_text.strip()) < 10:
+                raise RuntimeError("FASE 2: Output vuoto o troppo corto. Verifica il modello qwen2.5:14b.")
+
+            # ========================================================================
+            # Export finale
+            # ========================================================================
+            try:
+                chapter_md_path = out_dir / f"{mp4_path.stem}.capitolo.md"
+                save_markdown(chapter_md_path, chapter_text)
+                self._emit("log", f"Salvato capitolo Markdown: {chapter_md_path.name}")
             except Exception as e:
                 self._emit("log", f"ERRORE durante salvataggio Markdown: {e}")
                 raise
 
             try:
                 docx_path = out_dir / f"{mp4_path.stem}.docx"
-                save_docx(docx_path, structured_md, title=f"Lezione - {mp4_path.stem}")
+                save_docx(docx_path, chapter_text, title=f"Capitolo - {mp4_path.stem}")
                 self._emit("log", f"Creato DOCX: {docx_path.name}")
             except Exception as e:
                 self._emit("log", f"ERRORE durante creazione DOCX: {e}")

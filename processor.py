@@ -41,6 +41,43 @@ def load_prompt_templates(prompts_md_path: str | Path) -> str:
     return text.strip()
 
 
+def load_phase2_prompt(prompts_md_path: str | Path) -> str:
+    """
+    Estrae solo il system prompt della FASE 2 da prompts.md.
+    Cerca la sezione "## FASE 2" e estrae il contenuto tra i marker ```.
+    """
+    prompts_md_path = Path(prompts_md_path)
+    text = prompts_md_path.read_text(encoding="utf-8")
+    if not text.strip():
+        raise RuntimeError("prompts.md è vuoto: impossibile caricare il prompt FASE 2.")
+    
+    # Trova la sezione FASE 2
+    phase2_start = text.find("## FASE 2:")
+    if phase2_start == -1:
+        raise RuntimeError("Sezione FASE 2 non trovata in prompts.md")
+    
+    # Estrae tutto dalla sezione FASE 2 in poi
+    phase2_section = text[phase2_start:]
+    
+    # Trova il blocco di codice con il System Prompt
+    code_start = phase2_section.find("```")
+    if code_start == -1:
+        raise RuntimeError("Blocco di codice System Prompt non trovato nella sezione FASE 2")
+    
+    # Trova la fine del blocco di codice
+    code_end = phase2_section.find("```", code_start + 3)
+    if code_end == -1:
+        raise RuntimeError("Fine del blocco di codice System Prompt non trovata nella sezione FASE 2")
+    
+    # Estrae il contenuto tra i marker ``` (escludendo i marker stessi)
+    prompt_text = phase2_section[code_start + 3:code_end].strip()
+    
+    if not prompt_text:
+        raise RuntimeError("System Prompt FASE 2 vuoto in prompts.md")
+    
+    return prompt_text
+
+
 def _safe_tail_for_overlap(text: str, overlap: int) -> str:
     """
     Estrae una coda di lunghezza ~overlap caratteri, evitando (quando possibile)
@@ -230,4 +267,266 @@ def merge_chunk_results_to_markdown(results: list[ChunkResult]) -> str:
         if txt:
             parts.append(txt)
     return "\n\n".join(parts).strip() + "\n"
+
+
+# ============================================================================
+# TWO-PASS PIPELINE: FASE 1 - "The Cleaner"
+# ============================================================================
+
+def phase1_clean_transcript(
+    timestamped_transcript: str,
+    *,
+    model: str = "llama3.1:8b",
+    max_words_per_chunk: int = 2500,
+    overlap: int = 100,
+    progress_cb=None,  # progress_cb(done:int, total:int)
+    log_cb=None,  # log_cb(str)
+) -> str:
+    """
+    FASE 1: "The Cleaner"
+    Trasforma la trascrizione grezza in elenchi puntati dettagliati di fatti puri.
+    Usa un modello veloce (llama3.1:8b) per pulire e comprimere senza perdere informazioni.
+    
+    Returns:
+        Testo pulito concatenato (elenchi puntati dettagliati).
+    """
+    system_prompt = (
+        "Sei un analista dati rigoroso. Il tuo unico obiettivo è estrarre ogni singolo "
+        "concetto tecnico, definizione ed esempio dal testo grezzo fornito.\n\n"
+        "1. Ignora convenevoli, saluti e ripetizioni verbali.\n"
+        "2. Restituisci il contenuto sotto forma di **elenco puntato dettagliato**.\n"
+        "3. NON riassumere: mantieni la granulosità delle informazioni.\n"
+        "4. NON aggiungere introduzioni o conclusioni.\n"
+        "5. Mantieni i timestamp [MM:SS] se presenti nel testo originale."
+    )
+    
+    chunks = chunk_text_by_words(timestamped_transcript, max_words=max_words_per_chunk, overlap=overlap)
+    total = len(chunks)
+    
+    # Modello veloce: timeout aumentato a 90s per gestire chunk complessi
+    # (alcuni chunk possono richiedere 30-60s, specialmente con contenuto denso)
+    client = ollama.Client(timeout=90)
+    options = {"num_ctx": 4096}
+    
+    results: list[ChunkResult] = []
+    for i, ch in enumerate(chunks, start=1):
+        if log_cb:
+            log_cb(f"FASE 1 (Cleaner): chunk {i}/{total} ({len(ch.text.split())} parole)...")
+        
+        if ch.context:
+            user_prompt = (
+                "Estrai tutti i concetti tecnici e fatti dal seguente testo.\n"
+                "Nota: il testo include un CONTEXTO dal chunk precedente per continuità.\n"
+                "Regola: NON ripetere elementi già estratti dal CONTEXTO; estrai solo dal TESTO NUOVO.\n\n"
+                "### CONTEXTO (già processato, non ripetere)\n"
+                f"{ch.context}\n\n"
+                "### TESTO NUOVO (estrai qui)\n"
+                f"{ch.text}"
+            )
+        else:
+            user_prompt = (
+                "Estrai tutti i concetti tecnici e fatti dal seguente testo.\n"
+                "Restituisci un elenco puntato dettagliato, mantenendo la granulosità delle informazioni.\n\n"
+                f"{ch.text}"
+            )
+        
+        try:
+            resp = client.chat(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                options=options,
+            )
+        except Exception as e:
+            # Distingue timeout da altri errori
+            error_type = type(e).__name__
+            error_msg = str(e)
+            is_timeout = "timeout" in error_msg.lower() or "ReadTimeout" in error_type or "Timeout" in error_type
+            
+            if ResponseError is not None and isinstance(e, ResponseError):
+                status = getattr(e, "status_code", None)
+                msg = str(e)
+                if status == 404 and "not found" in msg.lower():
+                    installed = ""
+                    try:
+                        lst = client.list()
+                        names = [m.get("name") for m in (lst.get("models") or []) if isinstance(m, dict)]
+                        names = [n for n in names if n]
+                        if names:
+                            installed = "\nModelli installati: " + ", ".join(names)
+                    except Exception:
+                        installed = ""
+                    
+                    raise RuntimeError(
+                        f"Modello Ollama non trovato: '{model}'.\n"
+                        f"Esegui `ollama pull {model}` oppure seleziona un modello installato."
+                        f"{installed}"
+                    ) from e
+            
+            # Messaggio specifico per timeout
+            if is_timeout:
+                raise RuntimeError(
+                    f"Timeout durante elaborazione chunk {i}/{total}.\n"
+                    f"Ollama sta processando ma richiede più tempo del limite di 90s.\n"
+                    f"Considera di aumentare ulteriormente il timeout o ridurre la dimensione dei chunk."
+                ) from e
+            
+            raise RuntimeError(
+                "Impossibile contattare Ollama. Avvia il servizio (es. `ollama serve`) e verifica il modello installato."
+            ) from e
+        
+        content = ""
+        try:
+            content = (resp.get("message") or {}).get("content", "")  # type: ignore[assignment]
+        except Exception:
+            content = ""
+        content = (content or "").strip()
+        if not content:
+            content = "(Output vuoto da Ollama)"
+        
+        results.append(ChunkResult(chunk_index=i, input_word_count=len(ch.text.split()), output_text=content))
+        
+        if progress_cb:
+            progress_cb(i, total)
+    
+    # Concatena tutti i risultati
+    cleaned_text = merge_chunk_results_to_markdown(results)
+    return cleaned_text
+
+
+# ============================================================================
+# TWO-PASS PIPELINE: FASE 2 - "The Author"
+# ============================================================================
+
+def _estimate_tokens(text: str) -> int:
+    """
+    Stima approssimativa dei token: ~4 caratteri per token (conservativa).
+    """
+    return len(text) // 4
+
+
+def phase2_write_chapter(
+    cleaned_notes: str,
+    *,
+    prompts_md_path: str | Path,
+    model: str = "qwen2.5:14b",
+    max_tokens_per_chunk: int = 8000,
+    progress_cb=None,  # progress_cb(done:int, total:int)
+    log_cb=None,  # log_cb(str)
+) -> str:
+    """
+    FASE 2: "The Author"
+    Trasforma gli appunti puliti in un capitolo di libro completo, scorrevole e ben formattato.
+    Usa un modello grande (qwen2.5:14b) con CPU offloading per qualità massima.
+    
+    Args:
+        cleaned_notes: Testo pulito dalla Fase 1 (elenchi puntati dettagliati).
+        prompts_md_path: Percorso al file prompts.md da cui caricare il system prompt.
+        max_tokens_per_chunk: Se il testo supera questa soglia, viene diviso (default: 8000).
+    
+    Returns:
+        Capitolo di libro completo in Markdown.
+    """
+    system_prompt = load_phase2_prompt(prompts_md_path)
+    
+    # Stima se il testo può essere processato in un unico blocco
+    estimated_tokens = _estimate_tokens(cleaned_notes)
+    
+    if estimated_tokens <= max_tokens_per_chunk:
+        # Processa tutto in un unico blocco
+        if log_cb:
+            log_cb(f"FASE 2 (Author): testo completo (~{estimated_tokens} token stimati), processamento unico...")
+        
+        chunks_to_process = [cleaned_notes]
+        total = 1
+    else:
+        # Divide in chunk (raro, ma possibile per lezioni molto lunghe)
+        if log_cb:
+            log_cb(f"FASE 2 (Author): testo lungo (~{estimated_tokens} token), divisione in chunk...")
+        
+        # Usa chunking per caratteri (più semplice per questa fase)
+        chunk_size = max_tokens_per_chunk * 4  # ~4 char per token
+        chunks_to_process: list[str] = []
+        for i in range(0, len(cleaned_notes), chunk_size):
+            chunk = cleaned_notes[i:i + chunk_size]
+            if chunk.strip():
+                chunks_to_process.append(chunk.strip())
+        total = len(chunks_to_process)
+    
+    # Modello grande: timeout illimitato (CPU offloading può essere molto lento)
+    client = ollama.Client(timeout=None)
+    options = {"num_ctx": 8192}  # CRUCIALE: context window grande
+    
+    results: list[str] = []
+    for i, chunk_text in enumerate(chunks_to_process, start=1):
+        if log_cb:
+            log_cb(f"FASE 2 (Author): elaboro blocco {i}/{total}...")
+        
+        user_prompt = (
+            "Scrivi un capitolo di libro completo basato sui seguenti appunti strutturati.\n\n"
+            "REGOLA CRITICA - COMPLETEZZA:\n"
+            "- Includi TUTTI i concetti tecnici, definizioni, esempi e dettagli presenti negli appunti.\n"
+            "- NON omettere dettagli tecnici, classificazioni, tipologie o meccanismi descritti.\n"
+            "- Se gli appunti menzionano più elementi (es: 'nuvole cumuliformi, stratiformi, cirriformi'), includi TUTTI questi elementi nel capitolo.\n"
+            "- Il capitolo finale deve contenere almeno l'80-90% delle informazioni presenti negli appunti.\n\n"
+            "Organizza il contenuto:\n"
+            "- Trasforma gli elenchi in prosa fluida quando opportuno per la leggibilità.\n"
+            "- Organizza con titoli Markdown (##, ###) logici.\n"
+            "- Collega i concetti in modo fluido (senza salti logici).\n\n"
+            f"{chunk_text}"
+        )
+        
+        try:
+            resp = client.chat(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                options=options,
+            )
+        except Exception as e:
+            if ResponseError is not None and isinstance(e, ResponseError):
+                status = getattr(e, "status_code", None)
+                msg = str(e)
+                if status == 404 and "not found" in msg.lower():
+                    installed = ""
+                    try:
+                        lst = client.list()
+                        names = [m.get("name") for m in (lst.get("models") or []) if isinstance(m, dict)]
+                        names = [n for n in names if n]
+                        if names:
+                            installed = "\nModelli installati: " + ", ".join(names)
+                    except Exception:
+                        installed = ""
+                    
+                    raise RuntimeError(
+                        f"Modello Ollama non trovato: '{model}'.\n"
+                        f"Esegui `ollama pull {model}` oppure seleziona un modello installato."
+                        f"{installed}"
+                    ) from e
+            
+            raise RuntimeError(
+                "Impossibile contattare Ollama. Avvia il servizio (es. `ollama serve`) e verifica il modello installato."
+            ) from e
+        
+        content = ""
+        try:
+            content = (resp.get("message") or {}).get("content", "")  # type: ignore[assignment]
+        except Exception:
+            content = ""
+        content = (content or "").strip()
+        if not content:
+            content = "(Output vuoto da Ollama)"
+        
+        results.append(content)
+        
+        if progress_cb:
+            progress_cb(i, total)
+    
+    # Concatena i risultati (se divisi in chunk)
+    chapter_text = "\n\n".join(results).strip() + "\n"
+    return chapter_text
 
