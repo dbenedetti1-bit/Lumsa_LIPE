@@ -6,14 +6,15 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
-from tkinter import END, BOTH, DISABLED, NORMAL, Tk, filedialog, messagebox
+from tkinter import END, BOTH, DISABLED, NORMAL, Tk, filedialog, messagebox, StringVar, IntVar
 from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
 
 from audio import extract_audio_to_wav
 from exporter import save_docx, save_markdown
-from processor import phase1_clean_transcript, phase2_write_chapter
+from processor import phase1_clean_transcript, phase2_write_chapter, google_ai_write_chapter
 from transcriber import load_transcript_from_markdown, segments_to_timestamped_text, transcribe_wav
+from moviepy import VideoFileClip
 
 
 def _ts() -> str:
@@ -42,54 +43,198 @@ def _fmt_progress_chunks(label: str, done: float, total: float | None) -> str:
 class App(Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Trascrizioni - MP4 → DOC")
-        self.minsize(820, 520)
+        self.title("Trascrizioni - MP4 → Capitolo di Libro")
+        self.minsize(900, 700)
 
         self._event_q: Queue[tuple[str, object]] = Queue()
         self._worker: threading.Thread | None = None
         self._phase = "idle"
+        
+        # Statistiche
+        self._stats = {
+            "audio_duration": None,
+            "transcript_chars": 0,
+            "transcript_words": 0,
+            "notes_chars": 0,
+            "notes_words": 0,
+        }
 
         self._build_ui()
         self.after(100, self._drain_events)
 
     def _build_ui(self) -> None:
-        pad = {"padx": 10, "pady": 8}
-
-        top = ttk.Frame(self)
-        top.pack(fill="x", **pad)
-
-        self.btn_pick = ttk.Button(top, text="Carica MP4...", command=self._pick_mp4)
-        self.btn_pick.pack(side="left")
-
-        self.lbl_file = ttk.Label(top, text="Nessun file selezionato")
-        self.lbl_file.pack(side="left", padx=10)
-
-        options = ttk.Frame(self)
-        options.pack(fill="x", **pad)
-
-        ttk.Label(options, text="Chunk max parole (Fase 1):").pack(side="left")
-        self.chunk_var = ttk.Entry(options, width=8)
+        # Configura stile moderno
+        style = ttk.Style()
+        style.theme_use("clam")
+        
+        # Container principale con padding
+        main_container = ttk.Frame(self, padding=10)
+        main_container.pack(fill=BOTH, expand=True)
+        
+        # ========================================================================
+        # Sezione: File Selection
+        # ========================================================================
+        file_frame = ttk.LabelFrame(main_container, text="File", padding=8)
+        file_frame.pack(fill="x", pady=(0, 8))
+        
+        file_inner = ttk.Frame(file_frame)
+        file_inner.pack(fill="x")
+        
+        self.btn_pick = ttk.Button(file_inner, text="Carica MP4...", command=self._pick_mp4)
+        self.btn_pick.pack(side="left", padx=(0, 10))
+        
+        self.lbl_file = ttk.Label(file_inner, text="Nessun file selezionato", foreground="gray")
+        self.lbl_file.pack(side="left")
+        
+        # ========================================================================
+        # Sezione: Parametri Fase 1
+        # ========================================================================
+        phase1_frame = ttk.LabelFrame(main_container, text="Parametri Fase 1 (Cleaner)", padding=8)
+        phase1_frame.pack(fill="x", pady=(0, 8))
+        
+        phase1_inner = ttk.Frame(phase1_frame)
+        phase1_inner.pack(fill="x")
+        
+        ttk.Label(phase1_inner, text="Chunk max parole:").grid(row=0, column=0, padx=(0, 5), sticky="w")
+        self.chunk_var = ttk.Entry(phase1_inner, width=10)
         self.chunk_var.insert(0, "2500")
-        self.chunk_var.pack(side="left", padx=(6, 14))
-
-        ttk.Label(options, text="Overlap (caratteri):").pack(side="left")
-        self.overlap_var = ttk.Entry(options, width=8)
+        self.chunk_var.grid(row=0, column=1, padx=(0, 15))
+        
+        ttk.Label(phase1_inner, text="Overlap (caratteri):").grid(row=0, column=2, padx=(0, 5), sticky="w")
+        self.overlap_var = ttk.Entry(phase1_inner, width=10)
         self.overlap_var.insert(0, "100")
-        self.overlap_var.pack(side="left", padx=(6, 14))
-
-        self.btn_start = ttk.Button(options, text="Avvia workflow", command=self._start, state=DISABLED)
-        self.btn_start.pack(side="left")
-
-        self.progress = ttk.Progressbar(self, mode="determinate", maximum=100)
-        self.progress.pack(fill="x", **pad)
-        self.progress_label = ttk.Label(self, text="Pronto.")
-        self.progress_label.pack(fill="x", padx=10, pady=(0, 6))
-
-        self.log = ScrolledText(self, height=18)
-        self.log.pack(fill=BOTH, expand=True, padx=10, pady=(0, 10))
+        self.overlap_var.grid(row=0, column=3)
+        
+        # ========================================================================
+        # Sezione: Parametri Fase 2
+        # ========================================================================
+        phase2_frame = ttk.LabelFrame(main_container, text="Parametri Fase 2 (Author)", padding=8)
+        phase2_frame.pack(fill="x", pady=(0, 8))
+        
+        phase2_inner = ttk.Frame(phase2_frame)
+        phase2_inner.pack(fill="x")
+        
+        ttk.Label(phase2_inner, text="Chunk max parole:").grid(row=0, column=0, padx=(0, 5), sticky="w")
+        self.phase2_chunk_var = ttk.Entry(phase2_inner, width=10)
+        self.phase2_chunk_var.insert(0, "2500")
+        self.phase2_chunk_var.grid(row=0, column=1, padx=(0, 15))
+        
+        ttk.Label(phase2_inner, text="Overlap (caratteri):").grid(row=0, column=2, padx=(0, 5), sticky="w")
+        self.phase2_overlap_var = ttk.Entry(phase2_inner, width=10)
+        self.phase2_overlap_var.insert(0, "100")
+        self.phase2_overlap_var.grid(row=0, column=3, padx=(0, 15))
+        
+        ttk.Label(phase2_inner, text="Max tokens/chunk:").grid(row=0, column=4, padx=(0, 5), sticky="w")
+        self.phase2_max_tokens_var = ttk.Entry(phase2_inner, width=10)
+        self.phase2_max_tokens_var.insert(0, "8000")
+        self.phase2_max_tokens_var.grid(row=0, column=5)
+        
+        # ========================================================================
+        # Sezione: API Options
+        # ========================================================================
+        api_frame = ttk.LabelFrame(main_container, text="API Options", padding=8)
+        api_frame.pack(fill="x", pady=(0, 8))
+        
+        api_inner = ttk.Frame(api_frame)
+        api_inner.pack(fill="x")
+        
+        self.use_google_ai_var = IntVar(value=0)
+        ttk.Checkbutton(api_inner, text="Usa Google AI Studio", variable=self.use_google_ai_var, 
+                       command=self._toggle_google_ai).grid(row=0, column=0, sticky="w", padx=(0, 15))
+        
+        ttk.Label(api_inner, text="API Key:").grid(row=0, column=1, padx=(0, 5), sticky="w")
+        self.google_api_key_var = StringVar()
+        self.google_api_key_entry = ttk.Entry(api_inner, textvariable=self.google_api_key_var, width=40, show="*")
+        self.google_api_key_entry.grid(row=0, column=2, padx=(0, 15))
+        self.google_api_key_entry.configure(state=DISABLED)
+        
+        ttk.Label(api_inner, text="Modello:").grid(row=0, column=3, padx=(0, 5), sticky="w")
+        self.google_model_var = StringVar(value="gemini-2.5-flash")
+        google_model_combo = ttk.Combobox(api_inner, textvariable=self.google_model_var, width=20, state="readonly")
+        google_model_combo["values"] = ("gemini-2.5-flash",)
+        google_model_combo.grid(row=0, column=4, padx=(0, 15))
+        google_model_combo.configure(state=DISABLED)
+        self.google_model_combo = google_model_combo
+        
+        ttk.Label(api_inner, text="Start from:").grid(row=0, column=5, padx=(0, 5), sticky="w")
+        self.google_start_from_var = StringVar(value="notes")
+        self.radio_notes = ttk.Radiobutton(api_inner, text="Notes", variable=self.google_start_from_var, 
+                       value="notes", state=DISABLED)
+        self.radio_notes.grid(row=0, column=6, padx=(0, 10))
+        self.radio_transcript = ttk.Radiobutton(api_inner, text="Trascrizione", variable=self.google_start_from_var, 
+                       value="transcript", state=DISABLED)
+        self.radio_transcript.grid(row=0, column=7)
+        
+        # ========================================================================
+        # Sezione: Dashboard Statistiche
+        # ========================================================================
+        dashboard_frame = ttk.LabelFrame(main_container, text="Dashboard Statistiche", padding=8)
+        dashboard_frame.pack(fill="x", pady=(0, 8))
+        
+        dashboard_inner = ttk.Frame(dashboard_frame)
+        dashboard_inner.pack(fill="x")
+        
+        self.lbl_audio_duration = ttk.Label(dashboard_inner, text="Durata audio: --:--")
+        self.lbl_audio_duration.grid(row=0, column=0, padx=(0, 20), sticky="w")
+        
+        self.lbl_transcript_stats = ttk.Label(dashboard_inner, text="Trascrizione: 0 parole, 0 caratteri")
+        self.lbl_transcript_stats.grid(row=0, column=1, padx=(0, 20), sticky="w")
+        
+        self.lbl_notes_stats = ttk.Label(dashboard_inner, text="Notes: 0 parole, 0 caratteri")
+        self.lbl_notes_stats.grid(row=0, column=2, sticky="w")
+        
+        # ========================================================================
+        # Progress Bar
+        # ========================================================================
+        self.progress = ttk.Progressbar(main_container, mode="determinate", maximum=100)
+        self.progress.pack(fill="x", pady=(0, 5))
+        
+        self.progress_label = ttk.Label(main_container, text="Pronto.")
+        self.progress_label.pack(fill="x", pady=(0, 8))
+        
+        # ========================================================================
+        # Sezione: Log
+        # ========================================================================
+        log_frame = ttk.LabelFrame(main_container, text="Log", padding=8)
+        log_frame.pack(fill=BOTH, expand=True)
+        
+        self.log = ScrolledText(log_frame, height=15, wrap="word")
+        self.log.pack(fill=BOTH, expand=True)
         self._log("Pronto. Seleziona un MP4.")
-
+        
+        # ========================================================================
+        # Bottone Start
+        # ========================================================================
+        self.btn_start = ttk.Button(main_container, text="Avvia Workflow", command=self._start, state=DISABLED)
+        self.btn_start.pack(pady=(8, 0))
+        
         self.mp4_path: Path | None = None
+    
+    def _toggle_google_ai(self) -> None:
+        """Abilita/disabilita i controlli Google AI in base al checkbox"""
+        state = NORMAL if self.use_google_ai_var.get() else DISABLED
+        self.google_api_key_entry.configure(state=state)
+        self.google_model_combo.configure(state=state)
+        self.radio_notes.configure(state=state)
+        self.radio_transcript.configure(state=state)
+    
+    def _update_stats(self) -> None:
+        """Aggiorna le statistiche nella dashboard"""
+        # Durata audio
+        if self._stats["audio_duration"] is not None:
+            self.lbl_audio_duration.configure(text=f"Durata audio: {_fmt_mmss(self._stats['audio_duration'])}")
+        else:
+            self.lbl_audio_duration.configure(text="Durata audio: --:--")
+        
+        # Trascrizione
+        words = self._stats["transcript_words"]
+        chars = self._stats["transcript_chars"]
+        self.lbl_transcript_stats.configure(text=f"Trascrizione: {words:,} parole, {chars:,} caratteri")
+        
+        # Notes
+        words = self._stats["notes_words"]
+        chars = self._stats["notes_chars"]
+        self.lbl_notes_stats.configure(text=f"Notes: {words:,} parole, {chars:,} caratteri")
 
     def _log(self, msg: str) -> None:
         self.log.insert(END, f"[{_ts()}] {msg}\n")
@@ -115,10 +260,11 @@ class App(Tk):
             messagebox.showwarning("File mancante", "Seleziona prima un file MP4.")
             return
 
+        # Valida parametri Fase 1
         try:
             max_words = int(self.chunk_var.get().strip())
         except Exception:
-            messagebox.showerror("Valore non valido", "Chunk max parole deve essere un numero intero.")
+            messagebox.showerror("Valore non valido", "Chunk max parole (Fase 1) deve essere un numero intero.")
             return
 
         try:
@@ -126,17 +272,76 @@ class App(Tk):
             if overlap < 0:
                 raise ValueError("Overlap non può essere negativo")
         except Exception:
-            messagebox.showerror("Valore non valido", "Overlap deve essere un numero intero non negativo.")
+            messagebox.showerror("Valore non valido", "Overlap (Fase 1) deve essere un numero intero non negativo.")
             return
+
+        # Valida parametri Fase 2
+        try:
+            phase2_max_words = int(self.phase2_chunk_var.get().strip())
+        except Exception:
+            messagebox.showerror("Valore non valido", "Chunk max parole (Fase 2) deve essere un numero intero.")
+            return
+
+        try:
+            phase2_overlap = int(self.phase2_overlap_var.get().strip())
+            if phase2_overlap < 0:
+                raise ValueError("Overlap non può essere negativo")
+        except Exception:
+            messagebox.showerror("Valore non valido", "Overlap (Fase 2) deve essere un numero intero non negativo.")
+            return
+
+        try:
+            phase2_max_tokens = int(self.phase2_max_tokens_var.get().strip())
+            if phase2_max_tokens < 1000:
+                raise ValueError("Max tokens troppo basso")
+        except Exception:
+            messagebox.showerror("Valore non valido", "Max tokens (Fase 2) deve essere un numero intero >= 1000.")
+            return
+
+        # Valida Google AI se selezionato
+        use_google_ai = self.use_google_ai_var.get() == 1
+        google_api_key = ""
+        google_model = "gemini-2.5-flash"
+        google_start_from = "notes"
+        if use_google_ai:
+            google_api_key = self.google_api_key_var.get().strip()
+            if not google_api_key:
+                messagebox.showerror("API Key mancante", "Inserisci la Google AI Studio API Key.")
+                return
+            google_model = self.google_model_var.get().strip()
+            google_start_from = self.google_start_from_var.get()
+
+        # Reset statistiche
+        self._stats = {
+            "audio_duration": None,
+            "transcript_chars": 0,
+            "transcript_words": 0,
+            "notes_chars": 0,
+            "notes_words": 0,
+        }
+        self._update_stats()
 
         self.progress.configure(value=0, maximum=100)
         self.btn_start.configure(state=DISABLED)
         self.btn_pick.configure(state=DISABLED)
-        self._log("Avvio workflow in background... (trascrizione + 2 fasi Ollama)")
+        
+        api_type = "Google AI Studio" if use_google_ai else "Ollama"
+        self._log(f"Avvio workflow in background... (trascrizione + {api_type})")
 
         self._worker = threading.Thread(
             target=self._run_workflow,
-            kwargs={"mp4_path": self.mp4_path, "max_words": max_words, "overlap": overlap},
+            kwargs={
+                "mp4_path": self.mp4_path,
+                "max_words": max_words,
+                "overlap": overlap,
+                "phase2_max_words": phase2_max_words,
+                "phase2_overlap": phase2_overlap,
+                "phase2_max_tokens": phase2_max_tokens,
+                "use_google_ai": use_google_ai,
+                "google_api_key": google_api_key,
+                "google_model": google_model,
+                "google_start_from": google_start_from,
+            },
             daemon=True,
         )
         self._worker.start()
@@ -167,6 +372,10 @@ class App(Tk):
                     self.progress.configure(value=min(val, 100))
                     if label_txt:
                         self.progress_label.configure(text=label_txt)
+                elif kind == "stats":
+                    # Aggiorna statistiche
+                    self._stats.update(payload)  # type: ignore[arg-type]
+                    self._update_stats()
                 elif kind == "done":
                     self._log("Completato.")
                     self.btn_start.configure(state=NORMAL)
@@ -187,19 +396,41 @@ class App(Tk):
         finally:
             self.after(100, self._drain_events)
 
-    def _run_workflow(self, *, mp4_path: Path, max_words: int, overlap: int) -> None:
+    def _run_workflow(
+        self,
+        *,
+        mp4_path: Path,
+        max_words: int,
+        overlap: int,
+        phase2_max_words: int,
+        phase2_overlap: int,
+        phase2_max_tokens: int,
+        use_google_ai: bool,
+        google_api_key: str,
+        google_model: str,
+        google_start_from: str,
+    ) -> None:
         """
         Pipeline completa a due fasi:
         1) MP4 -> WAV
         2) Whisper -> segmenti (timestamp)
         3) FASE 1: Cleaner (llama3.1:8b) -> appunti puliti
-        4) FASE 2: Author (qwen2.5:14b) -> capitolo di libro
+        4) FASE 2: Author (qwen2.5:14b o Google AI) -> capitolo di libro
         5) Export MD + DOCX
         """
         try:
             t0 = time.time()
             out_dir = mp4_path.parent / "output" / mp4_path.stem
             out_dir.mkdir(parents=True, exist_ok=True)
+
+            # Calcola durata audio
+            try:
+                clip = VideoFileClip(str(mp4_path))
+                audio_duration = clip.duration
+                clip.close()
+                self._emit("stats", {"audio_duration": audio_duration})
+            except Exception:
+                audio_duration = None
 
             transcript_md_path = out_dir / f"{mp4_path.stem}.transcript.md"
             
@@ -234,53 +465,93 @@ class App(Tk):
                 save_markdown(transcript_md_path, "# Trascrizione (timestamp)\n\n" + transcript_text)
                 self._emit("log", f"Salvata trascrizione: {transcript_md_path.name}")
             
+            # Aggiorna statistiche trascrizione
+            if transcript_text:
+                self._emit("stats", {
+                    "transcript_chars": len(transcript_text),
+                    "transcript_words": len(transcript_text.split()),
+                })
+            
             # Verifica che il testo non sia vuoto
             if not transcript_text or len(transcript_text.strip()) < 10:
                 raise RuntimeError("Trascrizione vuota o troppo corta. Verifica il file audio o riprova la trascrizione.")
 
             # ========================================================================
-            # FASE 1: "The Cleaner" - Pulizia e compressione
+            # FASE 1: "The Cleaner" - Pulizia e compressione (solo se non usa Google AI da trascrizione)
             # ========================================================================
-            self._emit("log", "FASE 1: Pulizia trascrizione con llama3.1:8b...")
-            try:
-                cleaned_notes = phase1_clean_transcript(
-                    transcript_text,
-                    model="llama3.1:8b",
-                    max_words_per_chunk=max_words,
-                    overlap=overlap,
-                    progress_cb=lambda d, t: self._emit("progress", ("phase1", d, t)),
-                    log_cb=lambda m: self._emit("log", m),
-                )
-            except Exception as e:
-                self._emit("log", f"ERRORE durante FASE 1 (Cleaner): {e}")
-                raise
+            cleaned_notes = ""
+            if not (use_google_ai and google_start_from == "transcript"):
+                self._emit("log", "FASE 1: Pulizia trascrizione con llama3.1:8b...")
+                try:
+                    cleaned_notes = phase1_clean_transcript(
+                        transcript_text,
+                        model="llama3.1:8b",
+                        max_words_per_chunk=max_words,
+                        overlap=overlap,
+                        progress_cb=lambda d, t: self._emit("progress", ("phase1", d, t)),
+                        log_cb=lambda m: self._emit("log", m),
+                    )
+                except Exception as e:
+                    self._emit("log", f"ERRORE durante FASE 1 (Cleaner): {e}")
+                    raise
 
-            if not cleaned_notes or len(cleaned_notes.strip()) < 10:
-                raise RuntimeError("FASE 1: Output vuoto o troppo corto. Verifica il modello llama3.1:8b.")
+                if not cleaned_notes or len(cleaned_notes.strip()) < 10:
+                    raise RuntimeError("FASE 1: Output vuoto o troppo corto. Verifica il modello llama3.1:8b.")
 
-            # Salva file intermedio
-            temp_cleaned_path = out_dir / "temp_cleaned_notes.md"
-            save_markdown(temp_cleaned_path, cleaned_notes)
-            self._emit("log", f"FASE 1 completata: appunti puliti salvati in {temp_cleaned_path.name}")
+                # Salva file intermedio
+                notes_path = out_dir / f"{mp4_path.stem}.notes.md"
+                save_markdown(notes_path, cleaned_notes)
+                self._emit("log", f"FASE 1 completata: appunti puliti salvati in {notes_path.name}")
+                
+                # Aggiorna statistiche notes
+                self._emit("stats", {
+                    "notes_chars": len(cleaned_notes),
+                    "notes_words": len(cleaned_notes.split()),
+                })
+            else:
+                # Se usa Google AI da trascrizione, salta Fase 1
+                self._emit("log", "FASE 1 saltata: uso Google AI direttamente dalla trascrizione")
+                cleaned_notes = transcript_text  # Usa trascrizione come input per Google AI
 
             # ========================================================================
             # FASE 2: "The Author" - Scrittura capitolo
             # ========================================================================
-            self._emit("log", "FASE 2: Scrittura capitolo con qwen2.5:14b (può richiedere tempo)...")
-            try:
-                chapter_text = phase2_write_chapter(
-                    cleaned_notes,
-                    prompts_md_path=Path(__file__).with_name("prompts.md"),
-                    model="qwen2.5:14b",
-                    progress_cb=lambda d, t: self._emit("progress", ("phase2", d, t)),
-                    log_cb=lambda m: self._emit("log", m),
-                )
-            except Exception as e:
-                self._emit("log", f"ERRORE durante FASE 2 (Author): {e}")
-                raise
+            if use_google_ai:
+                self._emit("log", f"FASE 2: Scrittura capitolo con Google AI Studio ({google_model}, start from: {google_start_from})...")
+                try:
+                    chapter_text = google_ai_write_chapter(
+                        cleaned_notes,
+                        api_key=google_api_key,
+                        prompts_md_path=Path(__file__).with_name("prompts.md"),
+                        model=google_model,
+                        max_words_per_chunk=phase2_max_words,
+                        overlap=phase2_overlap,
+                        progress_cb=lambda d, t: self._emit("progress", ("phase2", d, t)),
+                        log_cb=lambda m: self._emit("log", m),
+                    )
+                except Exception as e:
+                    self._emit("log", f"ERRORE durante FASE 2 (Google AI): {e}")
+                    raise
+            else:
+                self._emit("log", "FASE 2: Scrittura capitolo con qwen2.5:14b (può richiedere tempo)...")
+                try:
+                    chapter_text = phase2_write_chapter(
+                        cleaned_notes,
+                        prompts_md_path=Path(__file__).with_name("prompts.md"),
+                        model="qwen2.5:14b",
+                        max_words_per_chunk=phase2_max_words,
+                        overlap=phase2_overlap,
+                        max_tokens_per_chunk=phase2_max_tokens,
+                        progress_cb=lambda d, t: self._emit("progress", ("phase2", d, t)),
+                        log_cb=lambda m: self._emit("log", m),
+                    )
+                except Exception as e:
+                    self._emit("log", f"ERRORE durante FASE 2 (Author): {e}")
+                    raise
 
             if not chapter_text or len(chapter_text.strip()) < 10:
-                raise RuntimeError("FASE 2: Output vuoto o troppo corto. Verifica il modello qwen2.5:14b.")
+                api_name = "Google AI" if use_google_ai else "qwen2.5:14b"
+                raise RuntimeError(f"FASE 2: Output vuoto o troppo corto. Verifica {api_name}.")
 
             # ========================================================================
             # Export finale

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -412,6 +413,8 @@ def phase2_write_chapter(
     *,
     prompts_md_path: str | Path,
     model: str = "qwen2.5:14b",
+    max_words_per_chunk: int = 2500,
+    overlap: int = 100,
     max_tokens_per_chunk: int = 8000,
     progress_cb=None,  # progress_cb(done:int, total:int)
     log_cb=None,  # log_cb(str)
@@ -424,7 +427,9 @@ def phase2_write_chapter(
     Args:
         cleaned_notes: Testo pulito dalla Fase 1 (elenchi puntati dettagliati).
         prompts_md_path: Percorso al file prompts.md da cui caricare il system prompt.
-        max_tokens_per_chunk: Se il testo supera questa soglia, viene diviso (default: 8000).
+        max_words_per_chunk: Dimensione massima chunk in parole (default: 2500).
+        overlap: Overlap tra chunk in caratteri (default: 100).
+        max_tokens_per_chunk: Limite token per chunk (default: 8000).
     
     Returns:
         Capitolo di libro completo in Markdown.
@@ -442,17 +447,17 @@ def phase2_write_chapter(
         chunks_to_process = [cleaned_notes]
         total = 1
     else:
-        # Divide in chunk (raro, ma possibile per lezioni molto lunghe)
+        # Divide in chunk con overlap (simile a Fase 1)
         if log_cb:
-            log_cb(f"FASE 2 (Author): testo lungo (~{estimated_tokens} token), divisione in chunk...")
+            log_cb(f"FASE 2 (Author): testo lungo (~{estimated_tokens} token), divisione in chunk con overlap...")
         
-        # Usa chunking per caratteri (più semplice per questa fase)
-        chunk_size = max_tokens_per_chunk * 4  # ~4 char per token
+        # Usa chunking per parole con overlap (come Fase 1)
+        text_chunks = chunk_text_by_words(cleaned_notes, max_words=max_words_per_chunk, overlap=overlap)
         chunks_to_process: list[str] = []
-        for i in range(0, len(cleaned_notes), chunk_size):
-            chunk = cleaned_notes[i:i + chunk_size]
-            if chunk.strip():
-                chunks_to_process.append(chunk.strip())
+        for ch in text_chunks:
+            # Per Fase 2, usiamo solo il testo (non il context separato)
+            # L'overlap è già gestito nel chunking
+            chunks_to_process.append(ch.text)
         total = len(chunks_to_process)
     
     # Modello grande: timeout illimitato (CPU offloading può essere molto lento)
@@ -527,6 +532,175 @@ def phase2_write_chapter(
             progress_cb(i, total)
     
     # Concatena i risultati (se divisi in chunk)
+    chapter_text = "\n\n".join(results).strip() + "\n"
+    return chapter_text
+
+
+# ============================================================================
+# GOOGLE AI STUDIO INTEGRATION
+# ============================================================================
+
+def google_ai_write_chapter(
+    input_text: str,
+    *,
+    api_key: str,
+    prompts_md_path: str | Path,
+    model: str = "gemini-2.5-flash",
+    max_words_per_chunk: int = 2500,
+    overlap: int = 100,
+    progress_cb=None,  # progress_cb(done:int, total:int)
+    log_cb=None,  # log_cb(str)
+) -> str:
+    """
+    Usa Google AI Studio (Gemini) per generare il capitolo.
+    Supporta start da trascrizione grezza o da notes puliti.
+    
+    Args:
+        input_text: Testo di input (trascrizione o notes).
+        api_key: Google AI Studio API key.
+        prompts_md_path: Percorso al file prompts.md da cui caricare il system prompt.
+        model: Modello Gemini da usare (default: gemini-2.5-flash).
+        max_words_per_chunk: Dimensione massima chunk in parole (default: 2500).
+        overlap: Overlap tra chunk in caratteri (default: 100).
+    
+    Returns:
+        Capitolo di libro completo in Markdown.
+    """
+    try:
+        import google.generativeai as genai
+        from google.api_core import exceptions as google_exceptions
+    except ImportError:
+        raise RuntimeError(
+            "google-generativeai non installato. Esegui: uv sync"
+        )
+    
+    system_prompt = load_phase2_prompt(prompts_md_path)
+    
+    # Configura API
+    genai.configure(api_key=api_key)
+    
+    # Google AI ha context window di ~1M token, quindi processiamo tutto insieme
+    # senza chunking (a meno che non sia veramente enorme, >800k token per sicurezza)
+    estimated_tokens = _estimate_tokens(input_text)
+    max_safe_tokens = 800000  # Limite di sicurezza (800k token, ben sotto 1M)
+    
+    if estimated_tokens <= max_safe_tokens:
+        # Processa tutto in un unico blocco (sfrutta la grande context window)
+        if log_cb:
+            log_cb(f"Google AI: testo completo (~{estimated_tokens:,} token stimati), processamento unico (context window: 1M token)...")
+        
+        chunks_to_process = [input_text]
+        total = 1
+    else:
+        # Solo se veramente enorme, divide in chunk (caso raro)
+        if log_cb:
+            log_cb(f"Google AI: testo molto lungo (~{estimated_tokens:,} token), divisione in chunk con overlap...")
+        
+        text_chunks = chunk_text_by_words(input_text, max_words=max_words_per_chunk, overlap=overlap)
+        chunks_to_process: list[str] = []
+        for ch in text_chunks:
+            chunks_to_process.append(ch.text)
+        total = len(chunks_to_process)
+    
+    # Crea il modello una volta (riutilizzato per tutti i chunk)
+    gemini_model = genai.GenerativeModel(
+        model_name=model,
+        system_instruction=system_prompt,
+    )
+    
+    results: list[str] = []
+    for i, chunk_text in enumerate(chunks_to_process, start=1):
+        if log_cb:
+            log_cb(f"Google AI: elaboro blocco {i}/{total}...")
+        
+        user_prompt = (
+            "Scrivi un capitolo di libro completo basato sui seguenti appunti strutturati.\n\n"
+            "REGOLA CRITICA - COMPLETEZZA:\n"
+            "- Includi TUTTI i concetti tecnici, definizioni, esempi e dettagli presenti negli appunti.\n"
+            "- NON omettere dettagli tecnici, classificazioni, tipologie o meccanismi descritti.\n"
+            "- Se gli appunti menzionano più elementi (es: 'nuvole cumuliformi, stratiformi, cirriformi'), includi TUTTI questi elementi nel capitolo.\n"
+            "- Il capitolo finale deve contenere almeno l'80-90% delle informazioni presenti negli appunti.\n\n"
+            "Organizza il contenuto:\n"
+            "- Trasforma gli elenchi in prosa fluida quando opportuno per la leggibilità.\n"
+            "- Organizza con titoli Markdown (##, ###) logici.\n"
+            "- Collega i concetti in modo fluido (senza salti logici).\n\n"
+            f"{chunk_text}"
+        )
+        
+        # Retry logic per gestire rate limit (429)
+        max_retries = 5
+        retry_delay = 20  # secondi (reset per ogni chunk)
+        content = ""
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                # Genera risposta
+                response = gemini_model.generate_content(user_prompt)
+                
+                if response.text:
+                    content = response.text.strip()
+                else:
+                    content = "(Output vuoto da Google AI)"
+                
+                # Successo, esci dal loop
+                break
+                
+            except Exception as e:
+                error_msg = str(e)
+                error_lower = error_msg.lower()
+                
+                # Controlla se è ResourceExhausted (429) o rate limit
+                # Verifica il tipo di eccezione e il codice di stato
+                is_rate_limit = False
+                try:
+                    # Prova a importare e verificare ResourceExhausted
+                    from google.api_core.exceptions import ResourceExhausted
+                    if isinstance(e, ResourceExhausted):
+                        is_rate_limit = True
+                except (ImportError, AttributeError):
+                    # Fallback: verifica stringhe nell'errore
+                    is_rate_limit = (
+                        "ResourceExhausted" in str(type(e).__name__) or
+                        "429" in error_msg or
+                        getattr(e, "status_code", None) == 429 or
+                        "rate limit" in error_lower or
+                        "quota" in error_lower
+                    )
+                
+                if is_rate_limit and attempt < max_retries:
+                    # Rate limit raggiunto, aspetta e riprova
+                    if log_cb:
+                        log_cb(f"Rate limit raggiunto (tentativo {attempt}/{max_retries}). Attendo {retry_delay} secondi...")
+                    time.sleep(retry_delay)
+                    # Backoff esponenziale: aumenta il delay per i tentativi successivi
+                    retry_delay = min(retry_delay * 1.5, 60)  # max 60 secondi
+                    continue
+                elif "API_KEY" in error_msg or "api key" in error_lower:
+                    raise RuntimeError(
+                        f"API Key Google AI non valida o mancante. Verifica la chiave inserita."
+                    ) from e
+                elif "not found" in error_lower or "not available" in error_lower or "invalid model" in error_lower:
+                    raise RuntimeError(
+                        f"Modello '{model}' non disponibile o non valido.\n"
+                        f"Usa: gemini-2.5-flash"
+                    ) from e
+                else:
+                    # Altri errori o rate limit dopo tutti i tentativi
+                    if is_rate_limit:
+                        raise RuntimeError(
+                            f"Rate limit Google AI raggiunto dopo {max_retries} tentativi. Riprova più tardi."
+                        ) from e
+                    else:
+                        raise RuntimeError(
+                            f"Errore durante chiamata Google AI: {error_msg}"
+                        ) from e
+        
+        results.append(content)
+        
+        if progress_cb:
+            progress_cb(i, total)
+    
+    # Concatena i risultati
     chapter_text = "\n\n".join(results).strip() + "\n"
     return chapter_text
 
