@@ -11,6 +11,8 @@ try:
 except Exception:  # pragma: no cover
     ResponseError = None  # type: ignore
 
+from constants import DEFAULT_GEMINI_MODEL
+
 
 @dataclass(frozen=True)
 class ChunkResult:
@@ -545,7 +547,7 @@ def google_ai_write_chapter(
     *,
     api_key: str,
     prompts_md_path: str | Path,
-    model: str = "gemini-2.5-flash",
+    model: str = DEFAULT_GEMINI_MODEL,
     max_words_per_chunk: int = 2500,
     overlap: int = 100,
     progress_cb=None,  # progress_cb(done:int, total:int)
@@ -559,7 +561,7 @@ def google_ai_write_chapter(
         input_text: Testo di input (trascrizione o notes).
         api_key: Google AI Studio API key.
         prompts_md_path: Percorso al file prompts.md da cui caricare il system prompt.
-        model: Modello Gemini da usare (default: gemini-2.5-flash).
+        model: Modello Gemini da usare (default: DEFAULT_GEMINI_MODEL).
         max_words_per_chunk: Dimensione massima chunk in parole (default: 2500).
         overlap: Overlap tra chunk in caratteri (default: 100).
     
@@ -680,9 +682,10 @@ def google_ai_write_chapter(
                         f"API Key Google AI non valida o mancante. Verifica la chiave inserita."
                     ) from e
                 elif "not found" in error_lower or "not available" in error_lower or "invalid model" in error_lower:
+                    from constants import GEMINI_MODELS
                     raise RuntimeError(
                         f"Modello '{model}' non disponibile o non valido.\n"
-                        f"Usa: gemini-2.5-flash"
+                        f"Modelli disponibili: {', '.join(GEMINI_MODELS)}"
                     ) from e
                 else:
                     # Altri errori o rate limit dopo tutti i tentativi

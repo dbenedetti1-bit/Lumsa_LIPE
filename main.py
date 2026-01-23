@@ -11,6 +11,7 @@ from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
 
 from audio import extract_audio_to_wav
+from constants import DEFAULT_GEMINI_MODEL, GEMINI_MODELS
 from exporter import save_docx, save_markdown
 from processor import phase1_clean_transcript, phase2_write_chapter, google_ai_write_chapter
 from transcriber import load_transcript_from_markdown, segments_to_timestamped_text, transcribe_wav
@@ -149,9 +150,9 @@ class App(Tk):
         self.google_api_key_entry.configure(state=DISABLED)
         
         ttk.Label(api_inner, text="Modello:").grid(row=0, column=3, padx=(0, 5), sticky="w")
-        self.google_model_var = StringVar(value="gemini-2.5-flash")
+        self.google_model_var = StringVar(value=DEFAULT_GEMINI_MODEL)
         google_model_combo = ttk.Combobox(api_inner, textvariable=self.google_model_var, width=20, state="readonly")
-        google_model_combo["values"] = ("gemini-2.5-flash",)
+        google_model_combo["values"] = GEMINI_MODELS
         google_model_combo.grid(row=0, column=4, padx=(0, 15))
         google_model_combo.configure(state=DISABLED)
         self.google_model_combo = google_model_combo
@@ -301,7 +302,7 @@ class App(Tk):
         # Valida Google AI se selezionato
         use_google_ai = self.use_google_ai_var.get() == 1
         google_api_key = ""
-        google_model = "gemini-2.5-flash"
+        google_model = DEFAULT_GEMINI_MODEL
         google_start_from = "notes"
         if use_google_ai:
             google_api_key = self.google_api_key_var.get().strip()
@@ -309,6 +310,9 @@ class App(Tk):
                 messagebox.showerror("API Key mancante", "Inserisci la Google AI Studio API Key.")
                 return
             google_model = self.google_model_var.get().strip()
+            if not google_model or google_model not in GEMINI_MODELS:
+                messagebox.showerror("Modello non valido", f"Seleziona un modello valido tra: {', '.join(GEMINI_MODELS)}")
+                return
             google_start_from = self.google_start_from_var.get()
 
         # Reset statistiche
