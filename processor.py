@@ -191,7 +191,7 @@ def ollama_process_chunks(
         if ch.context:
             user_prompt = (
                 "Trasforma la trascrizione in una sezione di libro divulgativo (output finale pronto).\n"
-                "Nota: il testo include un CONTEXTO ripetuto dal chunk precedente per continuità.\n"
+                "Nota: il testo può includere un CONTEXTO ripetuto dal chunk precedente per continuità.\n"
                 "Regola anti-ripetizione: NON riscrivere e NON parafrasare il CONTEXTO; usalo solo per capire dove riprendere.\n"
                 "Scrivi invece SOLO il contenuto relativo al TESTO NUOVO, evitando di ripetere frasi già presenti nel CONTEXTO.\n\n"
                 "### CONTEXTO (solo riferimento, non riscrivere)\n"
@@ -297,7 +297,7 @@ def phase1_clean_transcript(
         "Sei un analista dati rigoroso. Il tuo unico obiettivo è estrarre ogni singolo "
         "concetto tecnico, definizione ed esempio dal testo grezzo fornito.\n\n"
         "1. Ignora convenevoli, saluti e ripetizioni verbali.\n"
-        "2. Restituisci il contenuto sotto forma di **elenco puntato dettagliato**.\n"
+        "2. Restituisci il contenuto sotto forma discorsiva e, solo dove serve, un **elenco puntato dettagliato**.\n"
         "3. NON riassumere: mantieni la granulosità delle informazioni.\n"
         "4. NON aggiungere introduzioni o conclusioni.\n"
         "5. Mantieni i timestamp [MM:SS] se presenti nel testo originale."
@@ -472,16 +472,14 @@ def phase2_write_chapter(
             log_cb(f"FASE 2 (Author): elaboro blocco {i}/{total}...")
         
         user_prompt = (
-            "Scrivi un capitolo di libro completo basato sui seguenti appunti strutturati.\n\n"
-            "REGOLA CRITICA - COMPLETEZZA:\n"
-            "- Includi TUTTI i concetti tecnici, definizioni, esempi e dettagli presenti negli appunti.\n"
-            "- NON omettere dettagli tecnici, classificazioni, tipologie o meccanismi descritti.\n"
-            "- Se gli appunti menzionano più elementi (es: 'nuvole cumuliformi, stratiformi, cirriformi'), includi TUTTI questi elementi nel capitolo.\n"
-            "- Il capitolo finale deve contenere almeno l'80-90% delle informazioni presenti negli appunti.\n\n"
-            "Organizza il contenuto:\n"
-            "- Trasforma gli elenchi in prosa fluida quando opportuno per la leggibilità.\n"
-            "- Organizza con titoli Markdown (##, ###) logici.\n"
-            "- Collega i concetti in modo fluido (senza salti logici).\n\n"
+            "Scrivi un capitolo di libro completo, dettagliato e ben spiegato basato sul testo seguente.\n\n"
+            "COMPLETEZZA: Includi OGNI argomento e concetto presente nel testo; non omettere né saltare temi. "
+            "Se sono menzionate più voci (tipologie, elenchi, varianti), trattale tutte con chiarezza.\n\n"
+            "DETTAGLIO: Per ogni concetto tecnico fornisci una spiegazione chiara; definisci i termini specialistici; "
+            "mantieni numeri, dati e distinzioni e spiegane il significato. Collega argomenti affini anche se compaiono in punti diversi.\n\n"
+            "STRUTTURA: Usa titoli e sottotitoli Markdown (##, ###) logici; trasforma elenchi in prosa fluida senza perdere informazioni; "
+            "scrivi in modo che un lettore capisca bene ogni tema trattato.\n\n"
+            "---\n\n"
             f"{chunk_text}"
         )
         
@@ -542,6 +540,31 @@ def phase2_write_chapter(
 # GOOGLE AI STUDIO INTEGRATION
 # ============================================================================
 
+
+def _gemini_response_to_text(response) -> str:
+    """
+    Estrae il testo dalla risposta di Gemini (SDK google.genai) in modo sicuro.
+    """
+    try:
+        if hasattr(response, "text") and response.text:
+            return response.text
+    except (ValueError, AttributeError, IndexError, TypeError):
+        pass
+    try:
+        if getattr(response, "candidates", None) and len(response.candidates) > 0:
+            c = response.candidates[0]
+            content = getattr(c, "content", None)
+            if content and getattr(content, "parts", None):
+                parts = content.parts
+                if parts and len(parts) > 0:
+                    p = parts[0]
+                    if hasattr(p, "text"):
+                        return p.text or ""
+    except (AttributeError, IndexError, TypeError):
+        pass
+    return ""
+
+
 def google_ai_write_chapter(
     input_text: str,
     *,
@@ -569,17 +592,17 @@ def google_ai_write_chapter(
         Capitolo di libro completo in Markdown.
     """
     try:
-        import google.generativeai as genai
-        from google.api_core import exceptions as google_exceptions
+        from google import genai
+        from google.genai import types
     except ImportError:
         raise RuntimeError(
-            "google-generativeai non installato. Esegui: uv sync"
+            "google-genai non installato. Esegui: uv sync"
         )
     
     system_prompt = load_phase2_prompt(prompts_md_path)
     
-    # Configura API
-    genai.configure(api_key=api_key)
+    # Client per Gemini Developer API (google.genai)
+    client = genai.Client(api_key=api_key)
     
     # Google AI ha context window di ~1M token, quindi processiamo tutto insieme
     # senza chunking (a meno che non sia veramente enorme, >800k token per sicurezza)
@@ -604,11 +627,7 @@ def google_ai_write_chapter(
             chunks_to_process.append(ch.text)
         total = len(chunks_to_process)
     
-    # Crea il modello una volta (riutilizzato per tutti i chunk)
-    gemini_model = genai.GenerativeModel(
-        model_name=model,
-        system_instruction=system_prompt,
-    )
+    config = types.GenerateContentConfig(system_instruction=system_prompt)
     
     results: list[str] = []
     for i, chunk_text in enumerate(chunks_to_process, start=1):
@@ -616,16 +635,14 @@ def google_ai_write_chapter(
             log_cb(f"Google AI: elaboro blocco {i}/{total}...")
         
         user_prompt = (
-            "Scrivi un capitolo di libro completo basato sui seguenti appunti strutturati.\n\n"
-            "REGOLA CRITICA - COMPLETEZZA:\n"
-            "- Includi TUTTI i concetti tecnici, definizioni, esempi e dettagli presenti negli appunti.\n"
-            "- NON omettere dettagli tecnici, classificazioni, tipologie o meccanismi descritti.\n"
-            "- Se gli appunti menzionano più elementi (es: 'nuvole cumuliformi, stratiformi, cirriformi'), includi TUTTI questi elementi nel capitolo.\n"
-            "- Il capitolo finale deve contenere almeno l'80-90% delle informazioni presenti negli appunti.\n\n"
-            "Organizza il contenuto:\n"
-            "- Trasforma gli elenchi in prosa fluida quando opportuno per la leggibilità.\n"
-            "- Organizza con titoli Markdown (##, ###) logici.\n"
-            "- Collega i concetti in modo fluido (senza salti logici).\n\n"
+            "Scrivi un capitolo di libro completo, dettagliato e ben spiegato basato sul testo seguente.\n\n"
+            "COMPLETEZZA: Includi OGNI argomento e concetto presente nel testo; non omettere né saltare temi. "
+            "Se sono menzionate più voci (tipologie, elenchi, varianti), trattale tutte con chiarezza.\n\n"
+            "DETTAGLIO: Per ogni concetto tecnico fornisci una spiegazione chiara; definisci i termini specialistici; "
+            "mantieni numeri, dati e distinzioni e spiegane il significato. Collega argomenti affini anche se compaiono in punti diversi.\n\n"
+            "STRUTTURA: Usa titoli e sottotitoli Markdown (##, ###) logici; trasforma elenchi in prosa fluida senza perdere informazioni; "
+            "scrivi in modo che un lettore capisca bene ogni tema trattato.\n\n"
+            "---\n\n"
             f"{chunk_text}"
         )
         
@@ -636,13 +653,18 @@ def google_ai_write_chapter(
         
         for attempt in range(1, max_retries + 1):
             try:
-                # Genera risposta
-                response = gemini_model.generate_content(user_prompt)
-                
-                if response.text:
-                    content = response.text.strip()
-                else:
+                # Genera risposta (SDK google.genai)
+                response = client.models.generate_content(
+                    model=model,
+                    contents=user_prompt,
+                    config=config,
+                )
+                # Estrazione sicura del testo (response.text può sollevare se la risposta è bloccata/vuota)
+                content = _gemini_response_to_text(response)
+                if not content:
                     content = "(Output vuoto da Google AI)"
+                else:
+                    content = content.strip()
                 
                 # Successo, esci dal loop
                 break
@@ -651,23 +673,15 @@ def google_ai_write_chapter(
                 error_msg = str(e)
                 error_lower = error_msg.lower()
                 
-                # Controlla se è ResourceExhausted (429) o rate limit
-                # Verifica il tipo di eccezione e il codice di stato
-                is_rate_limit = False
-                try:
-                    # Prova a importare e verificare ResourceExhausted
-                    from google.api_core.exceptions import ResourceExhausted
-                    if isinstance(e, ResourceExhausted):
-                        is_rate_limit = True
-                except (ImportError, AttributeError):
-                    # Fallback: verifica stringhe nell'errore
-                    is_rate_limit = (
-                        "ResourceExhausted" in str(type(e).__name__) or
-                        "429" in error_msg or
-                        getattr(e, "status_code", None) == 429 or
-                        "rate limit" in error_lower or
-                        "quota" in error_lower
-                    )
+                # Controlla se è rate limit (429) o quota
+                is_rate_limit = (
+                    "429" in error_msg or
+                    getattr(e, "status_code", None) == 429 or
+                    "rate limit" in error_lower or
+                    "quota" in error_lower or
+                    "resourcelimit" in error_lower or
+                    "resource exhausted" in error_lower
+                )
                 
                 if is_rate_limit and attempt < max_retries:
                     # Rate limit raggiunto, aspetta e riprova

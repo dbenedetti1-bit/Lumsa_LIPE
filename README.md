@@ -1,6 +1,6 @@
-# Trascrizioni — MP4 → Trascrizione → Capitolo di Libro
+# Trascrizioni — MP4 / PDF → Capitolo di Libro
 
-Workflow locale a **due fasi** per trasformare video-lezioni `.mp4` in capitoli di libro completi e ben strutturati.
+Workflow locale a **due fasi** per trasformare video-lezioni `.mp4` **oppure** trascrizioni già in formato **PDF** in capitoli di libro completi e ben strutturati.
 
 ## Architettura: Two-Pass Pipeline
 
@@ -64,12 +64,13 @@ uv sync
 uv run python main.py
 ```
 
-### 3) Seleziona l'MP4 e avvia
+### 3) Seleziona il file e avvia
 
-Nella finestra moderna:
+Nella finestra:
 
 **File Selection:**
-- **Carica MP4...**: scegli il file video
+- **Carica MP4...**: scegli un video; il programma estrarrà l'audio e trascriverà con Whisper.
+- **Carica PDF (trascrizione)...**: scegli un PDF che contiene già il testo della trascrizione; il testo verrà estratto e usato direttamente per Fase 1 / Fase 2 (nessun audio né Whisper).
 
 **Parametri Fase 1 (Cleaner):**
 - **Chunk max parole**: default `2500` (consigliato 2000–3000 per evitare problemi di VRAM)
@@ -107,23 +108,21 @@ Nella finestra moderna:
 
 ## Dove viene generato l'output
 
-Per ogni video selezionato, l'output viene creato in:
+Per ogni file selezionato (MP4 o PDF), l'output viene creato in:
 
-- `output/<nome_video>/` (nella **stessa cartella** dell'MP4)
+- `output/<nome_file>/` (nella **stessa cartella** del file di input)
 
 Esempio:
 
-- Input: `D:\Lezioni\lezione1.mp4`
-- Output:
-  - `D:\Lezioni\output\lezione1\lezione1.wav` (audio estratto)
-  - `D:\Lezioni\output\lezione1\lezione1.transcript.md` (trascrizione grezza con timestamp)
-  - `D:\Lezioni\output\lezione1\lezione1.notes.md` (appunti puliti - Fase 1)
-  - `D:\Lezioni\output\lezione1\lezione1.capitolo.md` (capitolo finale - Fase 2)
-  - `D:\Lezioni\output\lezione1\lezione1.docx` (Word document)
+- Input MP4: `D:\Lezioni\lezione1.mp4`  
+  Output: `D:\Lezioni\output\lezione1\` con `lezione1.wav`, `lezione1.transcript.md`, `lezione1.notes.md`, `lezione1.capitolo.md`, `lezione1.docx`
+- Input PDF: `D:\Lezioni\trascrizione.pdf`  
+  Output: `D:\Lezioni\output\trascrizione\` con `trascrizione.transcript.md` (testo estratto), `trascrizione.notes.md`, `trascrizione.capitolo.md`, `trascrizione.docx` (nessun file WAV)
 
 ## Note importanti / Troubleshooting
 
-- **CUDA non disponibile**: la trascrizione fallisce con un errore esplicito (verifica driver NVIDIA, CUDA 12.x, che la GPU sia visibile).
+- **PDF senza testo**: se il PDF contiene solo immagini (scansioni) e non testo selezionabile, l'estrazione fallirà. Usa PDF con testo già presente o effettua OCR prima.
+- **CUDA non disponibile**: la trascrizione da MP4 fallisce con un errore esplicito (verifica driver NVIDIA, CUDA 12.x, che la GPU sia visibile).
 - **Ollama non attivo**: l'elaborazione fallisce con un errore esplicito (avvia `ollama serve`). **Non necessario se usi Google AI Studio.**
 - **Modelli Ollama mancanti**: se un modello Ollama non è installato, il programma suggerirà di eseguire `ollama pull <modello>`.
 - **Google AI API Key**: se usi Google AI Studio, assicurati di inserire una API key valida. Puoi ottenerla da https://aistudio.google.com/apikey

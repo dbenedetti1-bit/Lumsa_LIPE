@@ -13,6 +13,7 @@ from tkinter.scrolledtext import ScrolledText
 from audio import extract_audio_to_wav
 from constants import DEFAULT_GEMINI_MODEL, GEMINI_MODELS
 from exporter import save_docx, save_markdown
+from pdf_reader import extract_text_from_pdf
 from processor import phase1_clean_transcript, phase2_write_chapter, google_ai_write_chapter
 from transcriber import load_transcript_from_markdown, segments_to_timestamped_text, transcribe_wav
 from moviepy import VideoFileClip
@@ -44,7 +45,7 @@ def _fmt_progress_chunks(label: str, done: float, total: float | None) -> str:
 class App(Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Trascrizioni - MP4 → Capitolo di Libro")
+        self.title("Trascrizioni - MP4 / PDF → Capitolo di Libro")
         self.minsize(900, 700)
 
         self._event_q: Queue[tuple[str, object]] = Queue()
@@ -81,8 +82,10 @@ class App(Tk):
         file_inner = ttk.Frame(file_frame)
         file_inner.pack(fill="x")
         
-        self.btn_pick = ttk.Button(file_inner, text="Carica MP4...", command=self._pick_mp4)
-        self.btn_pick.pack(side="left", padx=(0, 10))
+        self.btn_pick_mp4 = ttk.Button(file_inner, text="Carica MP4...", command=self._pick_mp4)
+        self.btn_pick_mp4.pack(side="left", padx=(0, 10))
+        self.btn_pick_pdf = ttk.Button(file_inner, text="Carica PDF (trascrizione)...", command=self._pick_pdf)
+        self.btn_pick_pdf.pack(side="left", padx=(0, 10))
         
         self.lbl_file = ttk.Label(file_inner, text="Nessun file selezionato", foreground="gray")
         self.lbl_file.pack(side="left")
@@ -201,7 +204,7 @@ class App(Tk):
         
         self.log = ScrolledText(log_frame, height=15, wrap="word")
         self.log.pack(fill=BOTH, expand=True)
-        self._log("Pronto. Seleziona un MP4.")
+        self._log("Pronto. Seleziona un file MP4 o un PDF con trascrizione.")
         
         # ========================================================================
         # Bottone Start
@@ -209,7 +212,8 @@ class App(Tk):
         self.btn_start = ttk.Button(main_container, text="Avvia Workflow", command=self._start, state=DISABLED)
         self.btn_start.pack(pady=(8, 0))
         
-        self.mp4_path: Path | None = None
+        self.input_path: Path | None = None
+        self.input_type: str | None = None  # "mp4" | "pdf"
     
     def _toggle_google_ai(self) -> None:
         """Abilita/disabilita i controlli Google AI in base al checkbox"""
@@ -248,17 +252,31 @@ class App(Tk):
         )
         if not path:
             return
-        self.mp4_path = Path(path)
-        self.lbl_file.configure(text=str(self.mp4_path))
+        self.input_path = Path(path)
+        self.input_type = "mp4"
+        self.lbl_file.configure(text=str(self.input_path))
         self.btn_start.configure(state=NORMAL)
-        self._log(f"Selezionato: {self.mp4_path.name}")
+        self._log(f"Selezionato MP4: {self.input_path.name}")
+
+    def _pick_pdf(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Seleziona PDF con trascrizione",
+            filetypes=[("PDF", "*.pdf"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        self.input_path = Path(path)
+        self.input_type = "pdf"
+        self.lbl_file.configure(text=str(self.input_path))
+        self.btn_start.configure(state=NORMAL)
+        self._log(f"Selezionato PDF: {self.input_path.name}")
 
     def _start(self) -> None:
         if self._worker and self._worker.is_alive():
             messagebox.showinfo("In esecuzione", "Il workflow è già in esecuzione.")
             return
-        if not self.mp4_path:
-            messagebox.showwarning("File mancante", "Seleziona prima un file MP4.")
+        if not self.input_path or not self.input_type:
+            messagebox.showwarning("File mancante", "Seleziona un file MP4 o un PDF con trascrizione.")
             return
 
         # Valida parametri Fase 1
@@ -327,15 +345,17 @@ class App(Tk):
 
         self.progress.configure(value=0, maximum=100)
         self.btn_start.configure(state=DISABLED)
-        self.btn_pick.configure(state=DISABLED)
+        self.btn_pick_mp4.configure(state=DISABLED)
+        self.btn_pick_pdf.configure(state=DISABLED)
         
         api_type = "Google AI Studio" if use_google_ai else "Ollama"
-        self._log(f"Avvio workflow in background... (trascrizione + {api_type})")
+        self._log(f"Avvio workflow in background... ({self.input_type.upper()} + {api_type})")
 
         self._worker = threading.Thread(
             target=self._run_workflow,
             kwargs={
-                "mp4_path": self.mp4_path,
+                "input_path": self.input_path,
+                "input_type": self.input_type,
                 "max_words": max_words,
                 "overlap": overlap,
                 "phase2_max_words": phase2_max_words,
@@ -383,12 +403,14 @@ class App(Tk):
                 elif kind == "done":
                     self._log("Completato.")
                     self.btn_start.configure(state=NORMAL)
-                    self.btn_pick.configure(state=NORMAL)
+                    self.btn_pick_mp4.configure(state=NORMAL)
+                    self.btn_pick_pdf.configure(state=NORMAL)
                     self.progress.configure(value=100)
                     self.progress_label.configure(text="Completato.")
                 elif kind == "error":
                     self.btn_start.configure(state=NORMAL)
-                    self.btn_pick.configure(state=NORMAL)
+                    self.btn_pick_mp4.configure(state=NORMAL)
+                    self.btn_pick_pdf.configure(state=NORMAL)
                     self.progress.configure(value=0)
                     self.progress_label.configure(text="Errore.")
                     messagebox.showerror("Errore", str(payload))
@@ -403,7 +425,8 @@ class App(Tk):
     def _run_workflow(
         self,
         *,
-        mp4_path: Path,
+        input_path: Path,
+        input_type: str,
         max_words: int,
         overlap: int,
         phase2_max_words: int,
@@ -415,76 +438,81 @@ class App(Tk):
         google_start_from: str,
     ) -> None:
         """
-        Pipeline completa a due fasi:
-        1) MP4 -> WAV
-        2) Whisper -> segmenti (timestamp)
-        3) FASE 1: Cleaner (llama3.1:8b) -> appunti puliti
-        4) FASE 2: Author (qwen2.5:14b o Google AI) -> capitolo di libro
-        5) Export MD + DOCX
+        Pipeline: da MP4 (audio→trascrizione) o da PDF (testo già estratto),
+        poi FASE 1 (opzionale), FASE 2 (Author), export MD + DOCX.
         """
         try:
             t0 = time.time()
-            out_dir = mp4_path.parent / "output" / mp4_path.stem
+            stem = input_path.stem
+            out_dir = input_path.parent / "output" / stem
             out_dir.mkdir(parents=True, exist_ok=True)
 
-            # Calcola durata audio
-            try:
-                clip = VideoFileClip(str(mp4_path))
-                audio_duration = clip.duration
-                clip.close()
-                self._emit("stats", {"audio_duration": audio_duration})
-            except Exception:
-                audio_duration = None
+            transcript_text: str | None = None
 
-            transcript_md_path = out_dir / f"{mp4_path.stem}.transcript.md"
-            
-            # Controlla se transcript.md esiste già
-            transcript_text = load_transcript_from_markdown(transcript_md_path)
-            if transcript_text:
-                self._emit("log", f"Trascrizione già presente, salto → {transcript_md_path.name}")
-                self._emit("progress", ("transcription", 100.0, 100.0))  # completa al 100%
+            if input_type == "pdf":
+                # Input da PDF: estrazione testo (trascrizione già in PDF)
+                self._emit("log", f"Lettura PDF: {input_path.name}")
+                transcript_text = extract_text_from_pdf(input_path)
+                # Salva trascrizione estratta in .transcript.md per coerenza con il workflow
+                transcript_md_path = out_dir / f"{stem}.transcript.md"
+                save_markdown(transcript_md_path, "# Trascrizione (da PDF)\n\n" + transcript_text)
+                self._emit("log", f"Testo estratto e salvato in {transcript_md_path.name}")
+                self._emit("progress", ("transcription", 100.0, 100.0))
             else:
-                # Estrazione audio
-                wav_path = out_dir / f"{mp4_path.stem}.wav"
-                if wav_path.exists() and wav_path.stat().st_size > 0:
-                    self._emit("log", f"WAV già presente, salto estrazione → {wav_path.name}")
+                # Input da MP4: audio + Whisper
+                try:
+                    clip = VideoFileClip(str(input_path))
+                    audio_duration = clip.duration
+                    clip.close()
+                    self._emit("stats", {"audio_duration": audio_duration})
+                except Exception:
+                    pass
+
+                transcript_md_path = out_dir / f"{stem}.transcript.md"
+                transcript_text = load_transcript_from_markdown(transcript_md_path)
+                if transcript_text:
+                    n_words = len(transcript_text.split())
+                    self._emit("log", f"Trascrizione già presente ({n_words:,} parole), salto trascrizione → {transcript_md_path.name}")
+                    self._emit("progress", ("transcription", 100.0, 100.0))
                 else:
-                    self._emit("log", f"Estrazione audio → {wav_path.name}")
-                    extract_audio_to_wav(mp4_path, wav_path)
+                    wav_path = out_dir / f"{stem}.wav"
+                    if wav_path.exists() and wav_path.stat().st_size > 0:
+                        self._emit("log", f"WAV già presente, salto estrazione → {wav_path.name}")
+                    else:
+                        self._emit("log", f"Estrazione audio → {wav_path.name}")
+                        extract_audio_to_wav(input_path, wav_path)
 
-                # Trascrizione
-                self._emit("log", "Trascrizione Faster-Whisper (large-v3, cuda float16)...")
-                # header iniziale per append parziali
-                transcript_md_path.write_text("# Trascrizione (timestamp)\n\n", encoding="utf-8")
+                    self._emit("log", "Trascrizione Faster-Whisper (large-v3, cuda float16)...")
+                    transcript_md_path.write_text("# Trascrizione (timestamp)\n\n", encoding="utf-8")
+                    segments = transcribe_wav(
+                        wav_path,
+                        progress_cb=lambda done, total: self._emit("progress", ("transcription", done, total)),
+                        partial_path=transcript_md_path,
+                        partial_interval_s=300,
+                    )
+                    transcript_text = segments_to_timestamped_text(segments)
+                    save_markdown(transcript_md_path, "# Trascrizione (timestamp)\n\n" + transcript_text)
+                    self._emit("log", f"Salvata trascrizione: {transcript_md_path.name}")
 
-                segments = transcribe_wav(
-                    wav_path,
-                    progress_cb=lambda done, total: self._emit("progress", ("transcription", done, total)),
-                    partial_path=transcript_md_path,
-                    partial_interval_s=300,  # ogni 5 minuti
-                )
-                transcript_text = segments_to_timestamped_text(segments)
-
-                # Riscrive il file con la trascrizione completa (sovrascrive gli append parziali)
-                save_markdown(transcript_md_path, "# Trascrizione (timestamp)\n\n" + transcript_text)
-                self._emit("log", f"Salvata trascrizione: {transcript_md_path.name}")
-            
-            # Aggiorna statistiche trascrizione
             if transcript_text:
                 self._emit("stats", {
                     "transcript_chars": len(transcript_text),
                     "transcript_words": len(transcript_text.split()),
                 })
-            
-            # Verifica che il testo non sia vuoto
+
             if not transcript_text or len(transcript_text.strip()) < 10:
-                raise RuntimeError("Trascrizione vuota o troppo corta. Verifica il file audio o riprova la trascrizione.")
+                raise RuntimeError(
+                    "Trascrizione vuota o troppo corta. Verifica il file (audio/PDF) o riprova."
+                )
 
             # ========================================================================
-            # FASE 1: "The Cleaner" - Pulizia e compressione (solo se non usa Google AI da trascrizione)
+            # FASE 1: "The Cleaner" - Pulizia (Ollama). Saltata se: Google AI + (trascrizione oppure PDF)
             # ========================================================================
+            skip_phase1 = use_google_ai and (
+                google_start_from == "transcript" or input_type == "pdf"
+            )
             cleaned_notes = ""
-            if not (use_google_ai and google_start_from == "transcript"):
+            if not skip_phase1:
                 self._emit("log", "FASE 1: Pulizia trascrizione con llama3.1:8b...")
                 try:
                     cleaned_notes = phase1_clean_transcript(
@@ -503,7 +531,7 @@ class App(Tk):
                     raise RuntimeError("FASE 1: Output vuoto o troppo corto. Verifica il modello llama3.1:8b.")
 
                 # Salva file intermedio
-                notes_path = out_dir / f"{mp4_path.stem}.notes.md"
+                notes_path = out_dir / f"{stem}.notes.md"
                 save_markdown(notes_path, cleaned_notes)
                 self._emit("log", f"FASE 1 completata: appunti puliti salvati in {notes_path.name}")
                 
@@ -513,15 +541,17 @@ class App(Tk):
                     "notes_words": len(cleaned_notes.split()),
                 })
             else:
-                # Se usa Google AI da trascrizione, salta Fase 1
-                self._emit("log", "FASE 1 saltata: uso Google AI direttamente dalla trascrizione")
+                # Google AI da trascrizione o da PDF: nessuna Fase 1, nessun Ollama
+                self._emit("log", "FASE 1 saltata: uso API direttamente dal testo (nessun Ollama).")
                 cleaned_notes = transcript_text  # Usa trascrizione come input per Google AI
+                n_words = len(cleaned_notes.split())
+                self._emit("log", f"Input per FASE 2: {n_words:,} parole dalla trascrizione.")
 
             # ========================================================================
             # FASE 2: "The Author" - Scrittura capitolo
             # ========================================================================
             if use_google_ai:
-                self._emit("log", f"FASE 2: Scrittura capitolo con Google AI Studio ({google_model}, start from: {google_start_from})...")
+                self._emit("log", f"FASE 2: Scrittura capitolo con Google AI Studio (modello: {google_model})...")
                 try:
                     chapter_text = google_ai_write_chapter(
                         cleaned_notes,
@@ -561,7 +591,7 @@ class App(Tk):
             # Export finale
             # ========================================================================
             try:
-                chapter_md_path = out_dir / f"{mp4_path.stem}.capitolo.md"
+                chapter_md_path = out_dir / f"{stem}.capitolo.md"
                 save_markdown(chapter_md_path, chapter_text)
                 self._emit("log", f"Salvato capitolo Markdown: {chapter_md_path.name}")
             except Exception as e:
@@ -569,8 +599,8 @@ class App(Tk):
                 raise
 
             try:
-                docx_path = out_dir / f"{mp4_path.stem}.docx"
-                save_docx(docx_path, chapter_text, title=f"Capitolo - {mp4_path.stem}")
+                docx_path = out_dir / f"{stem}.docx"
+                save_docx(docx_path, chapter_text, title=f"Capitolo - {stem}")
                 self._emit("log", f"Creato DOCX: {docx_path.name}")
             except Exception as e:
                 self._emit("log", f"ERRORE durante creazione DOCX: {e}")
